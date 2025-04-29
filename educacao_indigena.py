@@ -146,7 +146,7 @@ def criar_esquema():
 def carregar_csv_censo():
     try:
         # Lê o arquivo CSV com os dados do censo escolar
-        df = pd.read_csv('microdados_censo_escolar_2023.csv', low_memory=False)
+        df = pd.read_csv('microdados_censo_escolar_2023.csv',  sep=';', low_memory=False, encoding='latin1')
 
         # Tratar valores nulos e tipos de dados
         # Substitui valores nulos por padrões e ajusta os tipos de dados
@@ -305,29 +305,33 @@ def carregar_xlsx(arquivos_xlsx):
     try:
         for arquivo in arquivos_xlsx:
             print(f"Processando arquivo: {arquivo}")
-            # Lê o arquivo XLSX
-            df = pd.read_excel(arquivo)
-
-            # Tratar valores nulos e inválidos
-            # Substitui valores ausentes ou inválidos por padrões
-            df = df.fillna(0)  # Substitui NaN por 0 para valores numéricos
-            df = df.replace('-', 0)  # Substitui '-' por 0 (valores ausentes no XLSX)
-
+            
             if 'frequencia_escolar.xlsx' in arquivo:
-                # Processar frequencia_escolar.xlsx
-                # Renomeia colunas e filtra faixas etárias principais
-                df = df.rename(columns={
-                    'Brasil e Unidade da Federação': 'UF',
-                    'Total': 'TAXA_FREQUENCIA'
-                })
-
-                # Filtrar apenas as faixas etárias principais
-                faixas_etarias = [
-                    '0 a 3 anos', '4 a 5 anos', '6 a 14 anos',
-                    '15 a 17 anos', '18 a 24 anos', '25 anos ou mais'
+                # Processar frequencia_escolar.xlsx com estrutura específica
+                # Ler o arquivo pulando as primeiras linhas que não contêm dados
+                df = pd.read_excel(arquivo, header=None, skiprows=5)
+                
+                # Verificar se o DataFrame não está vazio
+                if df.empty:
+                    print("Arquivo está vazio após pular linhas iniciais.")
+                    continue
+                
+                # Definir manualmente os nomes das colunas baseado na estrutura
+                colunas = ['UF'] + [f'col_{i}' for i in range(1, len(df.columns))]
+                df.columns = colunas
+                
+                # Filtrar apenas linhas com UFs válidas
+                ufs_brasil = [
+                    'Brasil', 'Rondônia', 'Acre', 'Amazonas', 'Roraima', 'Pará', 'Amapá', 'Tocantins',
+                    'Maranhão', 'Piauí', 'Ceará', 'Rio Grande do Norte', 'Paraíba', 'Pernambuco',
+                    'Alagoas', 'Sergipe', 'Bahia', 'Minas Gerais', 'Espírito Santo', 'Rio de Janeiro',
+                    'São Paulo', 'Paraná', 'Santa Catarina', 'Rio Grande do Sul', 'Mato Grosso do Sul',
+                    'Mato Grosso', 'Goiás', 'Distrito Federal'
                 ]
-
-                # Mapear nomes de UFs para siglas (para compatibilidade com ufs_dict)
+                
+                df = df[df['UF'].isin(ufs_brasil)].copy()
+                
+                # Mapear nomes de UFs para siglas
                 uf_to_sigla = {
                     'Rondônia': 'RO', 'Acre': 'AC', 'Amazonas': 'AM', 'Roraima': 'RR',
                     'Pará': 'PA', 'Amapá': 'AP', 'Tocantins': 'TO', 'Maranhão': 'MA',
@@ -339,35 +343,75 @@ def carregar_xlsx(arquivos_xlsx):
                     'Mato Grosso do Sul': 'MS', 'Mato Grosso': 'MT', 'Goiás': 'GO',
                     'Distrito Federal': 'DF'
                 }
-
-                # Processar apenas linhas com UFs válidas e faixas etárias principais
+                
+                # Definir manualmente as faixas etárias e suas colunas correspondentes
+                faixas_etarias = {
+                    '0 a 3 anos': 1,    # col_1
+                    '4 a 5 anos': 2,    # col_2
+                    '6 a 14 anos': 3,  # col_3
+                    '15 a 17 anos': 4,  # col_4
+                    '18 a 24 anos': 5,  # col_5
+                    '25 anos ou mais': 6 # col_6
+                }
+                
+                # Contador para acompanhar o progresso
+                total_insercoes = 0
+                
                 for _, row in df.iterrows():
                     uf_nome = row['UF']
                     if uf_nome == 'Brasil':
                         continue  # Ignorar o total nacional
+                        
                     if uf_nome not in uf_to_sigla:
-                        continue  # Ignorar UFs não mapeadas
+                        print(f"UF não mapeada: {uf_nome}")
+                        continue
+                        
                     sigla_uf = uf_to_sigla[uf_nome]
                     if sigla_uf not in ufs_dict:
-                        continue  # Ignorar se a UF não está no banco
-
+                        print(f"UF não encontrada no banco: {sigla_uf}")
+                        continue
+                        
                     # Obter todos os municípios da UF
                     cursor.execute(
                         'SELECT "ID_MUNICIPIO" FROM "Municipio" WHERE "ID_UF" = %s',
                         (ufs_dict[sigla_uf],)
                     )
                     municipios_uf = [r[0] for r in cursor.fetchall()]
-
-                    # Inserir a taxa de frequência para cada município da UF
-                    for faixa in faixas_etarias:
-                        if faixa in row and row[faixa] != 0:  # Verificar se a faixa existe e não é zero
-                            taxa = float(row[faixa])
-                            if 0 <= taxa <= 100:  # Validar a taxa
-                                for id_municipio in municipios_uf:
-                                    cursor.execute(
-                                        'INSERT INTO "Frequencia_Escolar" ("ID_MUNICIPIO", "FAIXA_ETARIA", "TAXA_FREQUENCIA") VALUES (%s, %s, %s)',
-                                        (id_municipio, faixa, taxa)
-                                    )
+                    
+                    if not municipios_uf:
+                        print(f"Nenhum município encontrado para UF: {sigla_uf}")
+                        continue
+                    
+                    # Inserir dados para cada faixa etária e município
+                    for faixa, col_idx in faixas_etarias.items():
+                        col_name = f'col_{col_idx}'
+                        if col_name not in row:
+                            print(f"Coluna {col_name} não encontrada para UF {uf_nome}")
+                            continue
+                            
+                        try:
+                            # Converter para float, tratando possíveis strings como 'X' ou '-'
+                            taxa_str = str(row[col_name]).replace(',', '.').strip()
+                            if taxa_str in ['-', '', 'X', '..', '...']:
+                                continue
+                                
+                            taxa = float(taxa_str)
+                            if not (0 <= taxa <= 100):
+                                print(f"Taxa inválida para {uf_nome}, faixa {faixa}: {taxa}")
+                                continue
+                                
+                            for id_municipio in municipios_uf:
+                                cursor.execute(
+                                    'INSERT INTO "Frequencia_Escolar" ("ID_MUNICIPIO", "FAIXA_ETARIA", "TAXA_FREQUENCIA") VALUES (%s, %s, %s)',
+                                    (id_municipio, faixa, taxa)
+                                )
+                                total_insercoes += 1
+                                
+                        except (ValueError, TypeError) as e:
+                            print(f"Erro ao processar taxa para {uf_nome}, faixa {faixa}: {e}")
+                            continue
+                
+                print(f"Total de inserções realizadas: {total_insercoes}")
 
             else:
                 # Processar outros arquivos XLSX (lógica genérica)
