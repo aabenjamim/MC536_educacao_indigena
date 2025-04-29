@@ -135,7 +135,7 @@ def criar_esquema():
         cursor.execute(schema_sql)
         conn.commit()
         print("Esquema criado com sucesso.")
-    except Exception as e:
+    except Exception as inner_exception:
         # Trata erros e desfaz alterações em caso de falha
         print(f"Erro ao criar esquema: {e}")
         conn.rollback()
@@ -148,6 +148,7 @@ def carregar_csv_censo():
     municipios_dict = {}
     escolas_dict = {}
 
+    print("Carregando CSV do Censo Escolar...")
     try:
         # Lê o arquivo CSV com os dados do censo escolar
         df = pd.read_csv('microdados_ed_basica_2023.csv', sep=';', low_memory=False, encoding='latin1')
@@ -282,6 +283,319 @@ def carregar_csv_censo():
 # Lê os dados de arquivos XLSX e insere nas tabelas do banco de dados
 def carregar_xlsx(arquivos_xlsx):
     try:
+        # Populate ufs_dict with data from the database
+        cursor.execute('SELECT "SIGLA_UF", "ID_UF" FROM "Unidade_Federativa"')
+        for sigla_uf, id_uf in cursor.fetchall():
+            ufs_dict[sigla_uf] = id_uf
+
+        for arquivo in arquivos_xlsx:
+            print(f"Processando arquivo: {arquivo}")
+            
+            # Lista de UFs válidas
+            ufs_brasil = [
+                'Brasil', 'Rondônia', 'Acre', 'Amazonas', 'Roraima', 'Pará', 'Amapá', 'Tocantins',
+                'Maranhão', 'Piauí', 'Ceará', 'Rio Grande do Norte', 'Paraíba', 'Pernambuco',
+                'Alagoas', 'Sergipe', 'Bahia', 'Minas Gerais', 'Espírito Santo', 'Rio de Janeiro',
+                'São Paulo', 'Paraná', 'Santa Catarina', 'Rio Grande do Sul', 'Mato Grosso do Sul',
+                'Mato Grosso', 'Goiás', 'Distrito Federal'
+            ]
+            
+            # Mapeamento de nomes de UFs para siglas
+            uf_to_sigla = {
+                'Rondônia': 'RO', 'Acre': 'AC', 'Amazonas': 'AM', 'Roraima': 'RR',
+                'Pará': 'PA', 'Amapá': 'AP', 'Tocantins': 'TO', 'Maranhão': 'MA',
+                'Piauí': 'PI', 'Ceará': 'CE', 'Rio Grande do Norte': 'RN',
+                'Paraíba': 'PB', 'Pernambuco': 'PE', 'Alagoas': 'AL', 'Sergipe': 'SE',
+                'Bahia': 'BA', 'Minas Gerais': 'MG', 'Espírito Santo': 'ES',
+                'Rio de Janeiro': 'RJ', 'São Paulo': 'SP', 'Paraná': 'PR',
+                'Santa Catarina': 'SC', 'Rio Grande do Sul': 'RS',
+                'Mato Grosso do Sul': 'MS', 'Mato Grosso': 'MT', 'Goiás': 'GO',
+                'Distrito Federal': 'DF'
+            }
+            
+            # Faixas etárias comuns
+            faixas_etarias = {
+                '0 a 3 anos': 1,    # col_1
+                '4 a 5 anos': 2,    # col_2
+                '6 a 14 anos': 3,   # col_3
+                '15 a 17 anos': 4,  # col_4
+                '18 a 24 anos': 5,  # col_5
+                '25 anos ou mais': 6 # col_6
+            }
+            
+            if 'frequencia_escolar.xlsx' in arquivo:
+                # Processar frequencia_escolar.xlsx
+                df = pd.read_excel(arquivo, header=None, skiprows=5)
+                
+                if df.empty:
+                    print("Arquivo está vazio após pular linhas iniciais.")
+                    continue
+                
+                colunas = ['UF'] + [f'col_{i}' for i in range(1, len(df.columns))]
+                df.columns = colunas
+                df = df[df['UF'].isin(ufs_brasil)].copy()
+                
+                total_insercoes = 0
+                
+                for _, row in df.iterrows():
+                    uf_nome = row['UF']
+                    if uf_nome == 'Brasil':
+                        continue
+                        
+                    if uf_nome not in uf_to_sigla:
+                        print(f"UF não mapeada: {uf_nome}")
+                        continue
+                        
+                    sigla_uf = uf_to_sigla[uf_nome]
+                    if sigla_uf not in ufs_dict:
+                        print(f"UF não encontrada no banco: {sigla_uf}")
+                        continue
+                        
+                    cursor.execute(
+                        'SELECT "ID_MUNICIPIO" FROM "Municipio" WHERE "ID_UF" = %s',
+                        (ufs_dict[sigla_uf],)
+                    )
+                    municipios_uf = [r[0] for r in cursor.fetchall()]
+                    
+                    if not municipios_uf:
+                        print(f"Nenhum município encontrado para UF: {sigla_uf}")
+                        continue
+                    
+                    for faixa, col_idx in faixas_etarias.items():
+                        col_name = f'col_{col_idx}'
+                        if col_name not in row:
+                            print(f"Coluna {col_name} não encontrada para UF {uf_nome}")
+                            continue
+                            
+                        try:
+                            taxa_str = str(row[col_name]).replace(',', '.').strip()
+                            if taxa_str in ['-', '', 'X', '..', '...']:
+                                continue
+                                
+                            taxa = float(taxa_str)
+                            if not (0 <= taxa <= 100):
+                                print(f"Taxa inválida para {uf_nome}, faixa {faixa}: {taxa}")
+                                continue
+                                
+                            for id_municipio in municipios_uf:
+                                cursor.execute(
+                                    'INSERT INTO "Frequencia_Escolar" ("ID_MUNICIPIO", "FAIXA_ETARIA", "TAXA_FREQUENCIA") VALUES (%s, %s, %s)',
+                                    (id_municipio, faixa, taxa)
+                                )
+                                total_insercoes += 1
+                                
+                        except (ValueError, TypeError) as e:
+                            print(f"Erro ao processar taxa para {uf_nome}, faixa {faixa}: {e}")
+                            continue
+                
+                print(f"Total de inserções realizadas em Frequencia_Escolar: {total_insercoes}")
+
+            elif 'media_anos.xlsx' in arquivo:
+                # Processar media_anos.xlsx
+                df = pd.read_excel(arquivo, header=None, skiprows=5)
+                
+                if df.empty:
+                    print("Arquivo está vazio após pular linhas iniciais.")
+                    continue
+                
+                colunas = ['UF'] + [f'col_{i}' for i in range(1, len(df.columns))]
+                df.columns = colunas
+                df = df[df['UF'].isin(ufs_brasil)].copy()
+                
+                total_insercoes = 0
+                
+                for _, row in df.iterrows():
+                    uf_nome = row['UF']
+                    if uf_nome == 'Brasil':
+                        continue
+                        
+                    if uf_nome not in uf_to_sigla:
+                        print(f"UF não mapeada: {uf_nome}")
+                        continue
+                        
+                    sigla_uf = uf_to_sigla[uf_nome]
+                    if sigla_uf not in ufs_dict:
+                        print(f"UF não encontrada no banco: {sigla_uf}")
+                        continue
+                        
+                    cursor.execute(
+                        'SELECT "ID_MUNICIPIO" FROM "Municipio" WHERE "ID_UF" = %s',
+                        (ufs_dict[sigla_uf],)
+                    )
+                    municipios_uf = [r[0] for r in cursor.fetchall()]
+                    
+                    if not municipios_uf:
+                        print(f"Nenhum município encontrado para UF: {sigla_uf}")
+                        continue
+                    
+                    for faixa, col_idx in faixas_etarias.items():
+                        col_name = f'col_{col_idx}'
+                        if col_name not in row:
+                            print(f"Coluna {col_name} não encontrada para UF {uf_nome}")
+                            continue
+                            
+                        try:
+                            media_str = str(row[col_name]).replace(',', '.').strip()
+                            if media_str in ['-', '', 'X', '..', '...']:
+                                continue
+                                
+                            media = float(media_str)
+                            if not (0 <= media <= 20):  # Suposição: média de anos de estudo entre 0 e 20
+                                print(f"Média inválida para {uf_nome}, faixa {faixa}: {media}")
+                                continue
+                                
+                            for id_municipio in municipios_uf:
+                                cursor.execute(
+                                    'INSERT INTO "Anos_Estudo" ("ID_MUNICIPIO", "FAIXA_ETARIA", "MEDIA_ANOS_ESTUDO") VALUES (%s, %s, %s)',
+                                    (id_municipio, faixa, media)
+                                )
+                                total_insercoes += 1
+                                
+                        except (ValueError, TypeError) as e:
+                            print(f"Erro ao processar média para {uf_nome}, faixa {faixa}: {e}")
+                            continue
+                
+                print(f"Total de inserções realizadas em Anos_Estudo: {total_insercoes}")
+
+            elif 'nivel_instrucao.xlsx' in arquivo:
+                # Processar nivel_instrucao.xlsx
+                df = pd.read_excel(arquivo, header=None, skiprows=5)
+                
+                if df.empty:
+                    print("Arquivo está vazio após pular linhas iniciais.")
+                    continue
+                
+                # Suposição: colunas são UF, FAIXA_ETARIA, NIVEL_INSTRUCAO, QT_PESSOAS
+                colunas = ['UF', 'FAIXA_ETARIA', 'NIVEL_INSTRUCAO', 'QT_PESSOAS']
+                if len(df.columns) < len(colunas):
+                    print(f"Estrutura inválida para {arquivo}: esperado pelo menos {len(colunas)} colunas")
+                    continue
+                
+                df.columns = colunas[:len(df.columns)]
+                df = df[df['UF'].isin(ufs_brasil)].copy()
+                
+                # Níveis de instrução válidos (suposição)
+                niveis_validos = [
+                    'Sem instrução', 'Fundamental incompleto', 'Fundamental completo',
+                    'Médio incompleto', 'Médio completo', 'Superior incompleto', 'Superior completo'
+                ]
+                
+                total_insercoes = 0
+                
+                for _, row in df.iterrows():
+                    uf_nome = row['UF']
+                    if uf_nome == 'Brasil':
+                        continue
+                        
+                    if uf_nome not in uf_to_sigla:
+                        print(f"UF não mapeada: {uf_nome}")
+                        continue
+                        
+                    sigla_uf = uf_to_sigla[uf_nome]
+                    if sigla_uf not in ufs_dict:
+                        print(f"UF não encontrada no banco: {sigla_uf}")
+                        continue
+                        
+                    cursor.execute(
+                        'SELECT "ID_MUNICIPIO" FROM "Municipio" WHERE "ID_UF" = %s',
+                        (ufs_dict[sigla_uf],)
+                    )
+                    municipios_uf = [r[0] for r in cursor.fetchall()]
+                    
+                    if not municipios_uf:
+                        print(f"Nenhum município encontrado para UF: {sigla_uf}")
+                        continue
+                    
+                    faixa = row['FAIXA_ETARIA']
+                    nivel = row['NIVEL_INSTRUCAO']
+                    if faixa not in faixas_etarias:
+                        print(f"Faixa etária inválida para {uf_nome}: {faixa}")
+                        continue
+                        
+                    if nivel not in niveis_validos:
+                        print(f"Nível de instrução inválido para {uf_nome}: {nivel}")
+                        continue
+                        
+                    try:
+                        qt_pessoas = float(str(row['QT_PESSOAS']).replace(',', '.').strip())
+                        if qt_pessoas < 0:
+                            print(f"Quantidade de pessoas inválida para {uf_nome}, faixa {faixa}: {qt_pessoas}")
+                            continue
+                            
+                        for id_municipio in municipios_uf:
+                            cursor.execute(
+                                'INSERT INTO "Nivel_Instrucao" ("ID_MUNICIPIO", "FAIXA_ETARIA", "NIVEL", "QT_PESSOAS") VALUES (%s, %s, %s, %s)',
+                                (id_municipio, faixa, nivel, qt_pessoas)
+                            )
+                            total_insercoes += 1
+                            
+                    except (ValueError, TypeError) as e:
+                        print(f"Erro ao processar quantidade para {uf_nome}, faixa {faixa}, nível {nivel}: {e}")
+                        continue
+                
+                print(f"Total de inserções realizadas em Nivel_Instrucao: {total_insercoes}")
+
+            else:
+                # Processar outros arquivos XLSX (lógica genérica)
+                df = pd.read_excel(arquivo)
+                df = df.fillna({
+                    'TAXA_FREQUENCIA': 0,
+                    'QT_PESSOAS': 0,
+                    'MEDIA_ANOS_ESTUDO': 0,
+                    'AREA': None,
+                    'POP_TOTAL': None,
+                    'ETNIA_DOMINANTE': None,
+                    'FAIXA_ETARIA': 'Desconhecida',
+                    'NIVEL_INSTRUCAO': 'Desconhecido',
+                    'NOME_TERRITORIO': None,
+                    'CO_MUNICIPIO': None,
+                    'CO_UF': None
+                })
+
+                if all(col in df.columns for col in ['CO_MUNICIPIO', 'FAIXA_ETARIA', 'TAXA_FREQUENCIA']):
+                    for _, row in df.iterrows():
+                        if row['CO_MUNICIPIO'] and row['CO_MUNICIPIO'] in municipios_dict:
+                            cursor.execute(
+                                'INSERT INTO "Frequencia_Escolar" ("ID_MUNICIPIO", "FAIXA_ETARIA", "TAXA_FREQUENCIA") VALUES (%s, %s, %s)',
+                                (municipios_dict[row['CO_MUNICIPIO']], row['FAIXA_ETARIA'], row['TAXA_FREQUENCIA'])
+                            )
+
+                if all(col in df.columns for col in ['CO_MUNICIPIO', 'FAIXA_ETARIA', 'NIVEL_INSTRUCAO', 'QT_PESSOAS']):
+                    for _, row in df.iterrows():
+                        if row['CO_MUNICIPIO'] and row['CO_MUNICIPIO'] in municipios_dict:
+                            cursor.execute(
+                                'INSERT INTO "Nivel_Instrucao" ("ID_MUNICIPIO", "FAIXA_ETARIA", "NIVEL", "QT_PESSOAS") VALUES (%s, %s, %s, %s)',
+                                (municipios_dict[row['CO_MUNICIPIO']], row['FAIXA_ETARIA'], row['NIVEL_INSTRUCAO'], row['QT_PESSOAS'])
+                            )
+
+                if all(col in df.columns for col in ['CO_MUNICIPIO', 'FAIXA_ETARIA', 'MEDIA_ANOS_ESTUDO']):
+                    for _, row in df.iterrows():
+                        if row['CO_MUNICIPIO'] and row['CO_MUNICIPIO'] in municipios_dict:
+                            cursor.execute(
+                                'INSERT INTO "Anos_Estudo" ("ID_MUNICIPIO", "FAIXA_ETARIA", "MEDIA_ANOS_ESTUDO") VALUES (%s, %s, %s)',
+                                (municipios_dict[row['CO_MUNICIPIO']], row['FAIXA_ETARIA'], row['MEDIA_ANOS_ESTUDO'])
+                            )
+
+                if all(col in df.columns for col in ['CO_UF', 'NOME_TERRITORIO']):
+                    for _, row in df.iterrows():
+                        if row['CO_UF'] and row['CO_UF'] in ufs_dict and row['NOME_TERRITORIO']:
+                            cursor.execute(
+                                'INSERT INTO "Territorio_Indigena" ("ID_UF", "NOME_TERRITORIO", "ETNIA_DOMINANTE", "AREA", "POP_TOTAL") VALUES (%s, %s, %s, %s, %s)',
+                                (
+                                    ufs_dict[row['CO_UF']],
+                                    row['NOME_TERRITORIO'],
+                                    row.get('ETNIA_DOMINANTE', None),
+                                    row.get('AREA', None),
+                                    row.get('POP_TOTAL', None)
+                                )
+                            )
+
+        conn.commit()
+        print("Todos os arquivos XLSX foram carregados com sucesso.")
+    except Exception as e:
+        print(f"Erro ao carregar XLSX: {e}")
+        conn.rollback()
+        
         # Populate ufs_dict with data from the database
         cursor.execute('SELECT "SIGLA_UF", "ID_UF" FROM "Unidade_Federativa"')
         for sigla_uf, id_uf in cursor.fetchall():
@@ -459,30 +773,116 @@ def carregar_xlsx(arquivos_xlsx):
 
         conn.commit()
         print("Todos os arquivos XLSX foram carregados com sucesso.")
-    except Exception as e:
+    except Exception as inner_exception:
         # Trata erros e desfaz alterações em caso de falha
-        print(f"Erro ao carregar XLSX: {e}")
+        print(f"Erro ao carregar XLSX: {inner_exception}")
         conn.rollback()
+
+# Função para executar consultas analíticas
+def executar_consultas_analiticas():
+    try:
+        print("\nExecutando consultas analíticas...")
+
+        # Consulta 1: Taxa de Frequência Escolar por Faixa Etária e Região
+        query1 = '''
+        SELECT r."NOME_REGIAO", f."FAIXA_ETARIA", AVG(f."TAXA_FREQUENCIA") as media_taxa_frequencia
+        FROM "Frequencia_Escolar" f
+        JOIN "Municipio" m ON f."ID_MUNICIPIO" = m."ID_MUNICIPIO"
+        JOIN "Unidade_Federativa" uf ON m."ID_UF" = uf."ID_UF"
+        JOIN "Regiao" r ON uf."ID_REGIAO" = r."ID_REGIAO"
+        GROUP BY r."NOME_REGIAO", f."FAIXA_ETARIA"
+        ORDER BY r."NOME_REGIAO", f."FAIXA_ETARIA";
+        '''
+        cursor.execute(query1)
+        print("\nConsulta 1: Taxa de Frequência Escolar por Faixa Etária e Região")
+        for row in cursor.fetchall():
+            print(f"Região: {row[0]}, Faixa Etária: {row[1]}, Média Taxa Frequência: {row[2]:.2f}%")
+
+        # Consulta 2: Proporção de Matrículas Indígenas por UF
+        query2 = '''
+        SELECT uf."NOME_UF", uf."SIGLA_UF",
+               SUM(m."QT_MATRICULAS_INDIGENAS") * 100.0 / NULLIF(SUM(m."QT_MATRICULAS_TOTAL"), 0) as proporcao_indigena
+        FROM "Matricula" m
+        JOIN "Escola" e ON m."ID_ESCOLA" = e."ID_ESCOLA"
+        JOIN "Municipio" mun ON e."ID_MUNICIPIO" = mun."ID_MUNICIPIO"
+        JOIN "Unidade_Federativa" uf ON mun."ID_UF" = uf."ID_UF"
+        WHERE m."ANO_REFERENCIA" = 2023
+        GROUP BY uf."NOME_UF", uf."SIGLA_UF"
+        HAVING SUM(m."QT_MATRICULAS_TOTAL") > 0
+        ORDER BY proporcao_indigena DESC;
+        '''
+        cursor.execute(query2)
+        print("\nConsulta 2: Proporção de Matrículas Indígenas por UF (2023)")
+        for row in cursor.fetchall():
+            print(f"UF: {row[0]} ({row[1]}), Proporção Indígena: {row[2]:.2f}%")
+
+        # Consulta 3: Municípios com Alta Média de Anos de Estudo em Faixa Etária Específica
+        query3 = '''
+        SELECT m."NOME_MUNICIPIO", uf."SIGLA_UF", a."MEDIA_ANOS_ESTUDO"
+        FROM "Anos_Estudo" a
+        JOIN "Municipio" m ON a."ID_MUNICIPIO" = m."ID_MUNICIPIO"
+        JOIN "Unidade_Federativa" uf ON m."ID_UF" = uf."ID_UF"
+        WHERE a."FAIXA_ETARIA" = '25 anos ou mais' AND a."MEDIA_ANOS_ESTUDO" > 10
+        ORDER BY a."MEDIA_ANOS_ESTUDO" DESC
+        LIMIT 10;
+        '''
+        cursor.execute(query3)
+        print("\nConsulta 3: Top 10 Municípios com Alta Média de Anos de Estudo (25 anos ou mais)")
+        for row in cursor.fetchall():
+            print(f"Município: {row[0]} ({row[1]}), Média Anos Estudo: {row[2]}")
+
+        # Consulta 4: Escolas Indígenas por Tipo de Dependência e Localização
+        query4 = '''
+        SELECT e."TIPO_DEPENDENCIA", e."TIPO_LOCALIZACAO", COUNT(*) as total_escolas
+        FROM "Escola" e
+        WHERE e."INDIGENA" = TRUE AND e."SITUACAO_FUNCIONAMENTO" = 'Ativa'
+        GROUP BY e."TIPO_DEPENDENCIA", e."TIPO_LOCALIZACAO"
+        ORDER BY total_escolas DESC;
+        '''
+        cursor.execute(query4)
+        print("\nConsulta 4: Escolas Indígenas por Tipo de Dependência e Localização")
+        for row in cursor.fetchall():
+            print(f"Dependência: {row[0]}, Localização: {row[1]}, Total Escolas: {row[2]}")
+
+        # Consulta 5: Territórios Indígenas com Alta População e Baixa Frequência Escolar
+        query5 = '''
+        SELECT t."NOME_TERRITORIO", uf."SIGLA_UF", t."POP_TOTAL", AVG(f."TAXA_FREQUENCIA") as media_frequencia
+        FROM "Territorio_Indigena" t
+        JOIN "Unidade_Federativa" uf ON t."ID_UF" = uf."ID_UF"
+        JOIN "Municipio" m ON uf."ID_UF" = m."ID_UF"
+        JOIN "Frequencia_Escolar" f ON m."ID_MUNICIPIO" = f."ID_MUNICIPIO"
+        WHERE t."POP_TOTAL" > 1000 AND f."FAIXA_ETARIA" = '6 a 14 anos'
+        GROUP BY t."NOME_TERRITORIO", uf."SIGLA_UF", t."POP_TOTAL"
+        HAVING AVG(f."TAXA_FREQUENCIA") < 50
+        ORDER BY media_frequencia ASC
+        LIMIT 5;
+        '''
+        cursor.execute(query5)
+        print("\nConsulta 5: Territórios Indígenas com Alta População e Baixa Frequência Escolar (6 a 14 anos)")
+        for row in cursor.fetchall():
+            print(f"Território: {row[0]} ({row[1]}), População: {row[2]}, Média Frequência: {row[3]:.2f}%")
+
+        conn.commit()
+        print("Consultas analíticas executadas com sucesso.")
+    except Exception as e:
+        print(f"Erro ao executar consultas analíticas: {e}")
+        conn.rollback()
+
 
 # Executar as funções
 if __name__ == "__main__":
-    # # Lista de arquivos XLSX a serem processados
     arquivos_xlsx = [
         'frequencia_escolar.xlsx',
-        # Adicione outros arquivos XLSX aqui
-        # Exemplo: 'nivel_instrucao.xlsx', 'territorios_indigenas.xlsx'
+        'nivel_instrucao.xlsx',
+        'media_anos.xlsx'
     ]
 
     try:
-        # Cria o esquema do banco de dados
         criar_esquema()
-        carregar_xlsx(arquivos_xlsx)
-        # Carrega os dados do CSV do censo escolar
         carregar_csv_censo()
-        # Carrega os dados dos arquivos XLSX
-        
+        carregar_xlsx(arquivos_xlsx)
+        executar_consultas_analiticas()
     finally:
-        # Fecha a conexão com o banco de dados
         cursor.close()
         conn.close()
         print("Conexão fechada.")
