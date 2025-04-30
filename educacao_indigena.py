@@ -274,6 +274,18 @@ def carregar_csv_censo():
             matriculas_data
         )
 
+        # 7. Territorio Indígena
+        # Na função carregar_csv_censo(), manter a abordagem original:
+        territorios = df[df['TP_LOCALIZACAO_DIFERENCIADA'] == 1][['SG_UF', 'NO_MUNICIPIO']].drop_duplicates()
+        for _, row in territorios.iterrows():
+            if row['SG_UF'] in ufs_dict:
+                id_uf = ufs_dict[row['SG_UF']]
+                nome_territorio = f"Território Indígena {row['NO_MUNICIPIO']}"
+                cursor.execute(
+                    'INSERT INTO "Territorio_Indigena" ("ID_UF", "NOME_TERRITORIO", "ETNIA_DOMINANTE", "AREA", "POP_TOTAL") VALUES (%s, %s, %s, %s, %s)',
+                    (id_uf, nome_territorio, None, None, None)
+                )
+
         conn.commit()
         print("CSV do Censo Escolar carregado com sucesso.")
     except Exception as e:
@@ -458,83 +470,118 @@ def carregar_xlsx(arquivos_xlsx):
                 print(f"Total de inserções realizadas em Anos_Estudo: {total_insercoes}")
 
             elif 'nivel_instrucao.xlsx' in arquivo:
-                # Processar nivel_instrucao.xlsx
-                df = pd.read_excel(arquivo, header=None, skiprows=5)
-                
-                if df.empty:
-                    print("Arquivo está vazio após pular linhas iniciais.")
-                    continue
-                
-                # Suposição: colunas são UF, FAIXA_ETARIA, NIVEL_INSTRUCAO, QT_PESSOAS
-                colunas = ['UF', 'FAIXA_ETARIA', 'NIVEL_INSTRUCAO', 'QT_PESSOAS']
-                if len(df.columns) < len(colunas):
-                    print(f"Estrutura inválida para {arquivo}: esperado pelo menos {len(colunas)} colunas")
-                    continue
-                
-                df.columns = colunas[:len(df.columns)]
-                df = df[df['UF'].isin(ufs_brasil)].copy()
-                
-                # Níveis de instrução válidos (suposição)
-                niveis_validos = [
-                    'Sem instrução', 'Fundamental incompleto', 'Fundamental completo',
-                    'Médio incompleto', 'Médio completo', 'Superior incompleto', 'Superior completo'
-                ]
-                
-                total_insercoes = 0
-                
-                for _, row in df.iterrows():
-                    uf_nome = row['UF']
-                    if uf_nome == 'Brasil':
-                        continue
-                        
-                    if uf_nome not in uf_to_sigla:
-                        print(f"UF não mapeada: {uf_nome}")
-                        continue
-                        
-                    sigla_uf = uf_to_sigla[uf_nome]
-                    if sigla_uf not in ufs_dict:
-                        print(f"UF não encontrada no banco: {sigla_uf}")
-                        continue
-                        
-                    cursor.execute(
-                        'SELECT "ID_MUNICIPIO" FROM "Municipio" WHERE "ID_UF" = %s',
-                        (ufs_dict[sigla_uf],)
-                    )
-                    municipios_uf = [r[0] for r in cursor.fetchall()]
+                try:
+                    # Ler o arquivo pulando metadados (5 primeiras linhas são cabeçalhos)
+                    df = pd.read_excel(arquivo, header=None, skiprows=5)
                     
-                    if not municipios_uf:
-                        print(f"Nenhum município encontrado para UF: {sigla_uf}")
+                    if df.empty:
+                        print("Arquivo está vazio após pular linhas iniciais.")
                         continue
                     
-                    faixa = row['FAIXA_ETARIA']
-                    nivel = row['NIVEL_INSTRUCAO']
-                    if faixa not in faixas_etarias:
-                        print(f"Faixa etária inválida para {uf_nome}: {faixa}")
-                        continue
-                        
-                    if nivel not in niveis_validos:
-                        print(f"Nível de instrução inválido para {uf_nome}: {nivel}")
-                        continue
-                        
-                    try:
-                        qt_pessoas = float(str(row['QT_PESSOAS']).replace(',', '.').strip())
-                        if qt_pessoas < 0:
-                            print(f"Quantidade de pessoas inválida para {uf_nome}, faixa {faixa}: {qt_pessoas}")
+                    # Níveis de instrução (baseado nos cabeçalhos)
+                    niveis_instrucao = [
+                        'Sem instrução e fundamental incompleto',
+                        'Fundamental completo e médio incompleto',
+                        'Médio completo e superior incompleto',
+                        'Superior completo'
+                    ]
+                    
+                    # Faixas etárias (baseado nos cabeçalhos)
+                    faixas_etarias = [
+                        'Total',
+                        '18 a 24 anos',
+                        '18 a 19 anos',
+                        '20 a 24 anos',
+                        '25 anos ou mais',
+                        '25 a 64 anos',
+                        '25 a 29 anos',
+                        '30 a 34 anos',
+                        '35 a 39 anos',
+                        '40 a 44 anos',
+                        '45 a 49 anos',
+                        '50 a 54 anos',
+                        '55 a 59 anos',
+                        '60 a 64 anos',
+                        '65 anos ou mais',
+                        '65 a 69 anos',
+                        '70 a 74 anos',
+                        '75 a 79 anos',
+                        '80 anos ou mais'
+                    ]
+                    
+                    # Primeiro, vamos criar um mapeamento de município para ID_MUNICIPIO
+                    cursor.execute('SELECT "NOME_MUNICIPIO", "ID_MUNICIPIO" FROM "Municipio"')
+                    municipios_dict = {row[0].upper(): row[1] for row in cursor.fetchall()}
+                    
+                    total_insercoes = 0
+                    
+                    # Processar cada linha (cada município/UF)
+                    for _, row in df.iterrows():
+                        # Verificar se a primeira célula contém texto (nome do município/UF)
+                        if pd.isna(row[0]) or not isinstance(row[0], str):
                             continue
                             
-                        for id_municipio in municipios_uf:
-                            cursor.execute(
-                                'INSERT INTO "Nivel_Instrucao" ("ID_MUNICIPIO", "FAIXA_ETARIA", "NIVEL", "QT_PESSOAS") VALUES (%s, %s, %s, %s)',
-                                (id_municipio, faixa, nivel, qt_pessoas)
-                            )
-                            total_insercoes += 1
+                        nome_local = row[0].strip()
+                        
+                        if nome_local == 'Brasil':
+                            continue  # Ignorar o total nacional
                             
-                    except (ValueError, TypeError) as e:
-                        print(f"Erro ao processar quantidade para {uf_nome}, faixa {faixa}, nível {nivel}: {e}")
-                        continue
-                
-                print(f"Total de inserções realizadas em Nivel_Instrucao: {total_insercoes}")
+                        # Verificar se é um município (está no nosso dicionário)
+                        nome_municipio = nome_local.upper()
+                        if nome_municipio not in municipios_dict:
+                            continue  # Pular UFs e outros que não são municípios específicos
+                            
+                        id_municipio = municipios_dict[nome_municipio]
+                        
+                        # Para cada nível de instrução (as colunas estão agrupadas por nível)
+                        for nivel_idx, nivel in enumerate(niveis_instrucao):
+                            # Calcular o deslocamento das colunas para este nível
+                            # Assumindo que cada nível tem um bloco de colunas para cada faixa etária
+                            col_offset = 1 + (len(faixas_etarias) * nivel_idx)
+                            
+                            # Para cada faixa etária
+                            for faixa_idx, faixa in enumerate(faixas_etarias):
+                                col_num = col_offset + faixa_idx
+                                if col_num >= len(row):
+                                    continue  # Evitar índices fora do range
+                                    
+                                # Obter valor da célula
+                                valor = row[col_num]
+                                
+                                # Verificar se o valor é numérico
+                                if pd.isna(valor):
+                                    continue
+                                    
+                                try:
+                                    qt_pessoas = int(float(valor))
 
+                                    nivel_abreviado = {
+                                    'Sem instrução e fundamental incompleto': 'Sem instrução',
+                                    'Fundamental completo e médio incompleto': 'Fundamental completo',
+                                    'Médio completo e superior incompleto': 'Médio completo',
+                                    'Superior completo': 'Superior completo'  # Já cabe em 30 chars
+                                    }
+                                        
+                                    nivel_para_inserir = nivel_abreviado[nivel]
+                                    
+                                    # Inserir no banco
+                                    cursor.execute(
+                                        'INSERT INTO "Nivel_Instrucao" ("ID_MUNICIPIO", "FAIXA_ETARIA", "NIVEL", "QT_PESSOAS") VALUES (%s, %s, %s, %s)',
+                                        (id_municipio, faixa, nivel_para_inserir, qt_pessoas)
+                                    )
+                                    total_insercoes += 1
+                                    
+                                except (ValueError, TypeError) as e:
+                                    print(f"Erro ao processar valor para {nome_local}, nível {nivel}, faixa {faixa}: {e}")
+                                    continue
+                    
+                    conn.commit()
+                    print(f"Total de inserções em Nivel_Instrucao: {total_insercoes}")
+                    
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Erro ao processar nível de instrução: {e}")
+                    
             else:
                 # Processar outros arquivos XLSX (lógica genérica)
                 df = pd.read_excel(arquivo)
