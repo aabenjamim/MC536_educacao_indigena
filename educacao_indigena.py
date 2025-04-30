@@ -151,7 +151,7 @@ def carregar_csv_censo():
         # Lê o arquivo CSV com os dados do censo escolar
         df = pd.read_csv('microdados_ed_basica_2023.csv', sep=';', low_memory=False, encoding='latin1')
         if df.empty:
-            raise ValueError("CSV file is empty or invalid.")
+            raise ValueError("CSV inválido! O arquivo está vazio ou não contém dados válidos.")
 
         # Tratar valores nulos e ajustar tipos de dados
         df.fillna({
@@ -259,49 +259,53 @@ def carregar_csv_censo():
 
         print(f"Dicionário criado com {len(municipios_cod_dict)} entradas")
 
-
-        # 4. Escola - Agora usando o dicionário auxiliar
+        # 4. Escola
         escolas = df[['CO_ENTIDADE', 'NO_ENTIDADE', 'CO_MUNICIPIO', 'TP_DEPENDENCIA', 
                     'TP_LOCALIZACAO', 'TP_SITUACAO_FUNCIONAMENTO', 'IN_EDUCACAO_INDIGENA']].drop_duplicates()
 
         escolas_data = []
+        failed_escolas = []
         for _, row in escolas.iterrows():
             id_municipio = municipios_cod_dict.get(row['CO_MUNICIPIO'])
             if id_municipio is None:
-                print(f"Município não encontrado para CO_MUNICIPIO: {row['CO_MUNICIPIO']}")
+                print(f"AVISO: Município não encontrado para CO_MUNICIPIO: {row['CO_MUNICIPIO']} (Escola: {row['NO_ENTIDADE']})")
+                failed_escolas.append(row['CO_ENTIDADE'])
                 continue
-                
             escolas_data.append((
                 row['NO_ENTIDADE'], 
                 id_municipio,
                 row['TP_DEPENDENCIA'],
                 row['TP_LOCALIZACAO'],
                 row['TP_SITUACAO_FUNCIONAMENTO'],
-                row['IN_EDUCACAO_INDIGENA']
+                row['IN_EDUCACAO_INDIGENA'],
+                row['CO_ENTIDADE']  # Include CO_ENTIDADE for mapping
             ))
 
         print(f"Total de escolas a inserir: {len(escolas_data)}")
+        print(f"Escolas ignoradas devido a município inválido: {len(failed_escolas)}")
 
         if escolas_data:
-            # Execute o batch insert
-            psycopg2.extras.execute_batch(
-                cursor,
-                'INSERT INTO "Escola" ("NOME_ESCOLA", "ID_MUNICIPIO", "TIPO_DEPENDENCIA", "TIPO_LOCALIZACAO", "SITUACAO_FUNCIONAMENTO", "INDIGENA") VALUES (%s, %s, %s, %s, %s, %s) RETURNING "ID_ESCOLA"',
-                escolas_data
-            )
-            
-            # Obtenha todos os IDs retornados de uma vez
-            returned_ids = [row[0] for row in cursor.fetchall()]
-            
-            # Atualize o dicionário garantindo que temos IDs para todas as escolas
-            escolas_dict.update({
-                row['CO_ENTIDADE']: returned_ids[i]
-                for i, (_, row) in enumerate(escolas.iterrows())
-                if i < len(returned_ids)
-            })
-            print(f"Total de escolas inseridas: {len(returned_ids)}")
+            print(f"Preparando para inserir {len(escolas_data)} escolas no banco de dados.")
+            escolas_dict.clear()  # Clear existing mappings
+            insert_query = '''
+                INSERT INTO "Escola" ("NOME_ESCOLA", "ID_MUNICIPIO", "TIPO_DEPENDENCIA", "TIPO_LOCALIZACAO", "SITUACAO_FUNCIONAMENTO", "INDIGENA")
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING "ID_ESCOLA"
+            '''
+            for escola in escolas_data:
+                try:
+                    cursor.execute(insert_query, escola[:-1])  # Exclude CO_ENTIDADE from insert
+                    id_escola = cursor.fetchone()[0]
+                    co_entidade = escola[-1]  # CO_ENTIDADE is the last element
+                    escolas_dict[co_entidade] = id_escola
+                except psycopg2.Error as e:
+                    print(f"ERRO: Falha ao inserir escola {escola[0]} (CO_ENTIDADE: {co_entidade}): {e}")
+                    conn.rollback()  # Rollback the failed insert
+                    conn.commit()  # Reset transaction state
+                    continue
+            conn.commit()
+            print(f"Dicionário de escolas atualizado com {len(escolas_dict)} entradas.")
         else:
-            print("Nenhuma escola para inserir - verifique os logs acima")    
+            print("Nenhuma escola para inserir - verifique os logs acima.")
 
         # 5. Turma
         niveis_ensino = ['Infantil', 'Fundamental', 'Médio', 'EJA']
@@ -312,7 +316,6 @@ def carregar_csv_censo():
             'EJA': 'QT_TUR_EJA'
         }
         turmas_data = []
-        # Adicione verificação antes de inserir turmas:
         print(f"Total de escolas no dicionário: {len(escolas_dict)}")
         if not escolas_dict:
             print("AVISO: Dicionário de escolas vazio - não é possível inserir turmas")
@@ -320,21 +323,36 @@ def carregar_csv_censo():
             for co_entidade, id_escola in escolas_dict.items():
                 escola_data = df[df['CO_ENTIDADE'] == co_entidade]
                 if escola_data.empty:
+                    print(f"AVISO: Nenhum dado encontrado para CO_ENTIDADE {co_entidade}")
                     continue
+                escola_row = escola_data.iloc[0]
                 for nivel in niveis_ensino:
                     col_name = turmas_columns.get(nivel)
                     if col_name not in df.columns:
-                        print(f"Column {col_name} not found in CSV. Skipping {nivel} for escola {co_entidade}")
+                        print(f"ERRO: Coluna {col_name} não encontrada no CSV. Pulando {nivel} para escola {co_entidade}")
                         continue
-                    qt_turmas = escola_data[col_name].iloc[0]
-                    qt_turmas_indigenas = qt_turmas if escola_data['IN_EDUCACAO_INDIGENA'].iloc[0] else 0
+                    qt_turmas = escola_row[col_name]
+                    try:
+                        qt_turmas = int(float(qt_turmas)) if pd.notna(qt_turmas) else 0
+                    except (ValueError, TypeError) as e:
+                        print(f"AVISO: Valor inválido para {col_name} na escola {co_entidade}: {qt_turmas}. Erro: {e}")
+                        qt_turmas = 0
+                    qt_turmas_indigenas = qt_turmas if escola_row['IN_EDUCACAO_INDIGENA'] else 0
                     if qt_turmas > 0:
-                        turmas_data.append((id_escola, nivel, int(qt_turmas), int(qt_turmas_indigenas)))
-            insert_batch(
-                'INSERT INTO "Turma" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_TURMAS", "QT_TURMAS_INDIGENAS") VALUES (%s, %s, %s, %s)',
-                turmas_data
-            )
-
+                        turmas_data.append((id_escola, nivel, qt_turmas, qt_turmas_indigenas))
+            if turmas_data:
+                print(f"Inserindo {len(turmas_data)} registros em Turma")
+                psycopg2.extras.execute_batch(
+                    cursor,
+                    'INSERT INTO "Turma" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_TURMAS", "QT_TURMAS_INDIGENAS") VALUES (%s, %s, %s, %s)',
+                    turmas_data
+                )
+                conn.commit()
+                cursor.execute('SELECT COUNT(*) FROM "Turma"')
+                print(f"Total de registros inseridos em Turma: {cursor.fetchone()[0]}")
+            else:
+                print("AVISO: Nenhum dado de turmas para inserir. Verifique se QT_TUR_* contém valores maiores que 0.")
+            
         # 6. Matricula
         matriculas = df[['CO_ENTIDADE', 'QT_MAT_BAS', 'QT_MAT_BAS_INDIGENA', 'NU_ANO_CENSO', 'IN_INF', 'IN_FUND_AI', 'IN_FUND_AF', 'IN_MED', 'IN_EJA']].drop_duplicates()
         matriculas_data = []
@@ -343,8 +361,10 @@ def carregar_csv_censo():
             print("AVISO: Dicionário de escolas vazio - não é possível inserir matrículas")
         else:
             for _, row in matriculas.iterrows():
-                id_escola = escolas_dict.get(row['CO_ENTIDADE'], None)
+                co_entidade = row['CO_ENTIDADE']
+                id_escola = escolas_dict.get(co_entidade)
                 if id_escola is None:
+                    print(f"AVISO: Escola com CO_ENTIDADE {co_entidade} não encontrada em escolas_dict")
                     continue
                 niveis = [
                     nivel for nivel, flag in zip(
@@ -352,14 +372,24 @@ def carregar_csv_censo():
                         [row['IN_INF'], row['IN_FUND_AI'] or row['IN_FUND_AF'], row['IN_MED'], row['IN_EJA']]
                     ) if flag == 1
                 ]
+                qt_mat_total = int(float(row['QT_MAT_BAS'])) if pd.notna(row['QT_MAT_BAS']) else 0
+                qt_mat_indigena = int(float(row['QT_MAT_BAS_INDIGENA'])) if pd.notna(row['QT_MAT_BAS_INDIGENA']) else 0
                 matriculas_data.extend(
-                    (id_escola, nivel, int(row['QT_MAT_BAS']), int(row['QT_MAT_BAS_INDIGENA']), row['NU_ANO_CENSO'])
+                    (id_escola, nivel, qt_mat_total, qt_mat_indigena, int(row['NU_ANO_CENSO']))
                     for nivel in niveis
                 )
-            insert_batch(
-                'INSERT INTO "Matricula" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_MATRICULAS_TOTAL", "QT_MATRICULAS_INDIGENAS", "ANO_REFERENCIA") VALUES (%s, %s, %s, %s, %s)',
-                matriculas_data
-            )
+            if matriculas_data:
+                print(f"Inserindo {len(matriculas_data)} registros em Matricula")
+                psycopg2.extras.execute_batch(
+                    cursor,
+                    'INSERT INTO "Matricula" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_MATRICULAS_TOTAL", "QT_MATRICULAS_INDIGENAS", "ANO_REFERENCIA") VALUES (%s, %s, %s, %s, %s)',
+                    matriculas_data
+                )
+                conn.commit()
+                cursor.execute('SELECT COUNT(*) FROM "Matricula"')
+                print(f"Total de registros inseridos em Matricula: {cursor.fetchone()[0]}")
+            else:
+                print("AVISO: Nenhum dado de matrículas para inserir. Verifique se QT_MAT_BAS > 0 e se IN_* flags estão ativos.")
 
         # 7. Territorio Indígena
         territorios = df[df['TP_LOCALIZACAO_DIFERENCIADA'] == 1][['SG_UF', 'NO_MUNICIPIO']].drop_duplicates()
@@ -960,14 +990,18 @@ def executar_consultas_analiticas():
         for row in cursor.fetchall():
             print(f"UF: {row[0]} ({row[1]}), Proporção Indígena: {row[2]:.2f}%")
 
-        # Consulta 3: Municípios com Alta Média de Anos de Estudo em Faixa Etária Específica
+        # Consulta 3: Municípios com Maior Proporção de Matrículas Indígenas
         query3 = '''
-        SELECT m."NOME_MUNICIPIO", uf."SIGLA_UF", a."MEDIA_ANOS_ESTUDO"
-        FROM "Anos_Estudo" a
-        JOIN "Municipio" m ON a."ID_MUNICIPIO" = m."ID_MUNICIPIO"
+        SELECT m."NOME_MUNICIPIO", uf."SIGLA_UF", 
+               ROUND(SUM(mat."QT_MATRICULAS_INDIGENAS") * 100.0 / NULLIF(SUM(mat."QT_MATRICULAS_TOTAL"), 0), 2) as proporcao_indigena
+        FROM "Matricula" mat
+        JOIN "Escola" e ON mat."ID_ESCOLA" = e."ID_ESCOLA"
+        JOIN "Municipio" m ON e."ID_MUNICIPIO" = m."ID_MUNICIPIO"
         JOIN "Unidade_Federativa" uf ON m."ID_UF" = uf."ID_UF"
-        WHERE a."FAIXA_ETARIA" = '25 anos ou mais' AND a."MEDIA_ANOS_ESTUDO" > 10
-        ORDER BY a."MEDIA_ANOS_ESTUDO" DESC
+        WHERE mat."ANO_REFERENCIA" = 2023
+        GROUP BY m."NOME_MUNICIPIO", uf."SIGLA_UF"
+        HAVING SUM(mat."QT_MATRICULAS_TOTAL") > 0
+        ORDER BY proporcao_indigena DESC
         LIMIT 10;
         '''
         cursor.execute(query3)
@@ -975,36 +1009,38 @@ def executar_consultas_analiticas():
         for row in cursor.fetchall():
             print(f"Município: {row[0]} ({row[1]}), Média Anos Estudo: {row[2]}")
 
-        # Consulta 4: Escolas Indígenas por Tipo de Dependência e Localização
+        # Consulta 4: Total de Escolas Indígenas por Região
         query4 = '''
-        SELECT e."TIPO_DEPENDENCIA", e."TIPO_LOCALIZACAO", COUNT(*) as total_escolas
+        SELECT r."NOME_REGIAO", COUNT(*) as total_escolas
         FROM "Escola" e
+        JOIN "Municipio" m ON e."ID_MUNICIPIO" = m."ID_MUNICIPIO"
+        JOIN "Unidade_Federativa" uf ON m."ID_UF" = uf."ID_UF"
+        JOIN "Regiao" r ON uf."ID_REGIAO" = r."ID_REGIAO"
         WHERE e."INDIGENA" = TRUE AND e."SITUACAO_FUNCIONAMENTO" = 'Ativa'
-        GROUP BY e."TIPO_DEPENDENCIA", e."TIPO_LOCALIZACAO"
+        GROUP BY r."NOME_REGIAO"
         ORDER BY total_escolas DESC;
         '''
         cursor.execute(query4)
-        print("\nConsulta 4: Escolas Indígenas por Tipo de Dependência e Localização")
+        print("\nConsulta 4: Total de Escolas Indígenas por Região")
         for row in cursor.fetchall():
-            print(f"Dependência: {row[0]}, Localização: {row[1]}, Total Escolas: {row[2]}")
+            print(f"Região: {row[0]}, Total Escolas: {row[1]}")
 
-        # Consulta 5: Territórios Indígenas com Alta População e Baixa Frequência Escolar
+        # Consulta 5: Municípios com Alta População Indígena e Baixa Frequência Escolar
         query5 = '''
-        SELECT t."NOME_TERRITORIO", uf."SIGLA_UF", t."POP_TOTAL", AVG(f."TAXA_FREQUENCIA") as media_frequencia
-        FROM "Territorio_Indigena" t
-        JOIN "Unidade_Federativa" uf ON t."ID_UF" = uf."ID_UF"
-        JOIN "Municipio" m ON uf."ID_UF" = m."ID_UF"
+        SELECT m."NOME_MUNICIPIO", uf."SIGLA_UF", m."POPULACAO_INDIGENA", AVG(f."TAXA_FREQUENCIA") as media_frequencia
+        FROM "Municipio" m
+        JOIN "Unidade_Federativa" uf ON m."ID_UF" = uf."ID_UF"
         JOIN "Frequencia_Escolar" f ON m."ID_MUNICIPIO" = f."ID_MUNICIPIO"
-        WHERE t."POP_TOTAL" > 1000 AND f."FAIXA_ETARIA" = '6 a 14 anos'
-        GROUP BY t."NOME_TERRITORIO", uf."SIGLA_UF", t."POP_TOTAL"
+        WHERE m."POPULACAO_INDIGENA" > 1000 AND f."FAIXA_ETARIA" = '6 a 14 anos'
+        GROUP BY m."NOME_MUNICIPIO", uf."SIGLA_UF", m."POPULACAO_INDIGENA"
         HAVING AVG(f."TAXA_FREQUENCIA") < 50
         ORDER BY media_frequencia ASC
         LIMIT 5;
         '''
         cursor.execute(query5)
-        print("\nConsulta 5: Territórios Indígenas com Alta População e Baixa Frequência Escolar (6 a 14 anos)")
+        print("\nConsulta 5: Municípios com Alta População Indígena e Baixa Frequência Escolar (6 a 14 anos)")
         for row in cursor.fetchall():
-            print(f"Território: {row[0]} ({row[1]}), População: {row[2]}, Média Frequência: {row[3]:.2f}%")
+            print(f"Município: {row[0]} ({row[1]}), População Indígena: {row[2]}, Média Frequência: {row[3]:.2f}%")
 
         conn.commit()
         print("Consultas analíticas executadas com sucesso.")
