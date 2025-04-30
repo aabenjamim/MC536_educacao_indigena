@@ -183,8 +183,9 @@ def carregar_csv_censo():
             'INSERT INTO "Regiao" ("NOME_REGIAO", "POPULACAO_TOTAL", "POPULACAO_INDIGENA") VALUES (%s, %s, %s) RETURNING "ID_REGIAO"',
             regioes_data
         )
-        returned_ids = [row[0] for row in cursor.fetchall()]
-        regioes_dict.update({row['NO_REGIAO']: id_regiao for _, row in regioes.iterrows() for id_regiao in returned_ids[:len(regioes)]})
+
+        cursor.execute('SELECT "NOME_REGIAO", "ID_REGIAO" FROM "Regiao"')
+        regioes_dict = {nome: id_regiao for nome, id_regiao in cursor.fetchall()}
 
         # 2. Unidade_Federativa
         ufs = df.groupby(['SG_UF', 'NO_UF', 'NO_REGIAO']).agg({'QT_MAT_BAS': 'sum', 'QT_MAT_BAS_INDIGENA': 'sum'}).reset_index()
@@ -196,8 +197,8 @@ def carregar_csv_censo():
             'INSERT INTO "Unidade_Federativa" ("NOME_UF", "SIGLA_UF", "ID_REGIAO", "POPULACAO_TOTAL", "POPULACAO_INDIGENA") VALUES (%s, %s, %s, %s, %s) RETURNING "ID_UF"',
             ufs_data
         )
-        returned_ids = [row[0] for row in cursor.fetchall()]
-        ufs_dict.update({row['SG_UF']: id_uf for _, row in ufs.iterrows() for id_uf in returned_ids[:len(ufs)]})
+        cursor.execute('SELECT "SIGLA_UF", "ID_UF" FROM "Unidade_Federativa"')
+        ufs_dict = {sigla: id_uf for sigla, id_uf in cursor.fetchall()}
 
         # 3. Municipio
         municipios = df.groupby(['CO_MUNICIPIO', 'NO_MUNICIPIO', 'SG_UF']).agg({'QT_MAT_BAS': 'sum', 'QT_MAT_BAS_INDIGENA': 'sum'}).reset_index()
@@ -209,73 +210,111 @@ def carregar_csv_censo():
             'INSERT INTO "Municipio" ("NOME_MUNICIPIO", "ID_UF", "POPULACAO_TOTAL", "POPULACAO_INDIGENA") VALUES (%s, %s, %s, %s) RETURNING "ID_MUNICIPIO"',
             municipios_data
         )
-        returned_ids = [row[0] for row in cursor.fetchall()]
-        municipios_dict.update({row['CO_MUNICIPIO']: id_municipio for _, row in municipios.iterrows() for id_municipio in returned_ids[:len(municipios)]})
+
+        cursor.execute('SELECT "NOME_MUNICIPIO", "ID_MUNICIPIO" FROM "Municipio"')
+        municipios_dict = {nome: id_municipio for nome, id_municipio in cursor.fetchall()}
 
         # 4. Escola
-        escolas = df[['CO_ENTIDADE', 'NO_ENTIDADE', 'CO_MUNICIPIO', 'TP_DEPENDENCIA', 'TP_LOCALIZACAO', 'TP_SITUACAO_FUNCIONAMENTO', 'IN_EDUCACAO_INDIGENA']].drop_duplicates()
-        escolas_data = [
-            (row['NO_ENTIDADE'], municipios_dict.get(row['CO_MUNICIPIO'], None), row['TP_DEPENDENCIA'], row['TP_LOCALIZACAO'], row['TP_SITUACAO_FUNCIONAMENTO'], row['IN_EDUCACAO_INDIGENA'])
-            for _, row in escolas.iterrows() if row['CO_MUNICIPIO'] in municipios_dict
-        ]
-        insert_batch(
-            'INSERT INTO "Escola" ("NOME_ESCOLA", "ID_MUNICIPIO", "TIPO_DEPENDENCIA", "TIPO_LOCALIZACAO", "SITUACAO_FUNCIONAMENTO", "INDIGENA") VALUES (%s, %s, %s, %s, %s, %s) RETURNING "ID_ESCOLA"',
-            escolas_data
-        )
-        returned_ids = [row[0] for row in cursor.fetchall()]
-        escolas_dict.update({row['CO_ENTIDADE']: id_escola for _, row in escolas.iterrows() for id_escola in returned_ids[:len(escolas)]})
+        escolas = df[['CO_ENTIDADE', 'NO_ENTIDADE', 'CO_MUNICIPIO', 'TP_DEPENDENCIA', 
+                    'TP_LOCALIZACAO', 'TP_SITUACAO_FUNCIONAMENTO', 'IN_EDUCACAO_INDIGENA']].drop_duplicates()
+
+        # Verificar se há dados para inserir
+        print(f"Total de escolas encontradas no CSV: {len(escolas)}")
+        print(f"Exemplo de CO_MUNICIPIO: {escolas['CO_MUNICIPIO'].iloc[0]}")
+
+        # Verificar mapeamento de municípios
+        cursor.execute('SELECT COUNT(*) FROM "Municipio"')
+        print(f"Total de municípios no banco: {cursor.fetchone()[0]}")
+
+        escolas_data = []
+        for _, row in escolas.iterrows():
+            id_municipio = municipios_dict.get(str(row['CO_MUNICIPIO']))
+            if id_municipio is None:
+                print(f"Município não encontrado para CO_MUNICIPIO: {row['CO_MUNICIPIO']}")
+                continue
+                
+            escolas_data.append((
+                row['NO_ENTIDADE'], 
+                id_municipio,
+                row['TP_DEPENDENCIA'],
+                row['TP_LOCALIZACAO'],
+                row['TP_SITUACAO_FUNCIONAMENTO'],
+                row['IN_EDUCACAO_INDIGENA']
+            ))
+
+        print(f"Total de escolas a inserir: {len(escolas_data)}")
+
+        if escolas_data:
+            psycopg2.extras.execute_batch(
+                cursor,
+                'INSERT INTO "Escola" ("NOME_ESCOLA", "ID_MUNICIPIO", "TIPO_DEPENDENCIA", "TIPO_LOCALIZACAO", "SITUACAO_FUNCIONAMENTO", "INDIGENA") VALUES (%s, %s, %s, %s, %s, %s) RETURNING "ID_ESCOLA"',
+                escolas_data
+            )
+            returned_ids = [row[0] for row in cursor.fetchall()]
+            escolas_dict.update({row['CO_ENTIDADE']: id_escola for row, id_escola in zip(escolas.itertuples(), returned_ids)})
+            print(f"Total de escolas inseridas: {len(returned_ids)}")
+        else:
+            print("Nenhuma escola para inserir - verifique os logs acima")    
 
         # 5. Turma
         niveis_ensino = ['Infantil', 'Fundamental', 'Médio', 'EJA']
         turmas_columns = {
             'Infantil': 'QT_TUR_INF',
-            'Fundamental': 'QT_TUR_FUND',  # Replace with the actual column name from CSV
+            'Fundamental': 'QT_TUR_FUND',
             'Médio': 'QT_TUR_MED',
             'EJA': 'QT_TUR_EJA'
         }
         turmas_data = []
-        for co_entidade, id_escola in escolas_dict.items():
-            escola_data = df[df['CO_ENTIDADE'] == co_entidade]
-            if escola_data.empty:
-                continue
-            for nivel in niveis_ensino:
-                col_name = turmas_columns.get(nivel)
-                if col_name not in df.columns:
-                    print(f"Column {col_name} not found in CSV. Skipping {nivel} for escola {co_entidade}")
+        # Adicione verificação antes de inserir turmas:
+        print(f"Total de escolas no dicionário: {len(escolas_dict)}")
+        if not escolas_dict:
+            print("AVISO: Dicionário de escolas vazio - não é possível inserir turmas")
+        else:
+            for co_entidade, id_escola in escolas_dict.items():
+                escola_data = df[df['CO_ENTIDADE'] == co_entidade]
+                if escola_data.empty:
                     continue
-                qt_turmas = escola_data[col_name].iloc[0]
-                qt_turmas_indigenas = qt_turmas if escola_data['IN_EDUCACAO_INDIGENA'].iloc[0] else 0
-                if qt_turmas > 0:
-                    turmas_data.append((id_escola, nivel, int(qt_turmas), int(qt_turmas_indigenas)))
-        insert_batch(
-            'INSERT INTO "Turma" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_TURMAS", "QT_TURMAS_INDIGENAS") VALUES (%s, %s, %s, %s)',
-            turmas_data
-        )
+                for nivel in niveis_ensino:
+                    col_name = turmas_columns.get(nivel)
+                    if col_name not in df.columns:
+                        print(f"Column {col_name} not found in CSV. Skipping {nivel} for escola {co_entidade}")
+                        continue
+                    qt_turmas = escola_data[col_name].iloc[0]
+                    qt_turmas_indigenas = qt_turmas if escola_data['IN_EDUCACAO_INDIGENA'].iloc[0] else 0
+                    if qt_turmas > 0:
+                        turmas_data.append((id_escola, nivel, int(qt_turmas), int(qt_turmas_indigenas)))
+            insert_batch(
+                'INSERT INTO "Turma" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_TURMAS", "QT_TURMAS_INDIGENAS") VALUES (%s, %s, %s, %s)',
+                turmas_data
+            )
 
         # 6. Matricula
         matriculas = df[['CO_ENTIDADE', 'QT_MAT_BAS', 'QT_MAT_BAS_INDIGENA', 'NU_ANO_CENSO', 'IN_INF', 'IN_FUND_AI', 'IN_FUND_AF', 'IN_MED', 'IN_EJA']].drop_duplicates()
         matriculas_data = []
-        for _, row in matriculas.iterrows():
-            id_escola = escolas_dict.get(row['CO_ENTIDADE'], None)
-            if id_escola is None:
-                continue
-            niveis = [
-                nivel for nivel, flag in zip(
-                    ['Infantil', 'Fundamental', 'Médio', 'EJA'],
-                    [row['IN_INF'], row['IN_FUND_AI'] or row['IN_FUND_AF'], row['IN_MED'], row['IN_EJA']]
-                ) if flag == 1
-            ]
-            matriculas_data.extend(
-                (id_escola, nivel, int(row['QT_MAT_BAS']), int(row['QT_MAT_BAS_INDIGENA']), row['NU_ANO_CENSO'])
-                for nivel in niveis
+        print(f"Total de escolas no dicionário: {len(escolas_dict)}")
+        if not escolas_dict:
+            print("AVISO: Dicionário de escolas vazio - não é possível inserir matrículas")
+        else:
+            for _, row in matriculas.iterrows():
+                id_escola = escolas_dict.get(row['CO_ENTIDADE'], None)
+                if id_escola is None:
+                    continue
+                niveis = [
+                    nivel for nivel, flag in zip(
+                        ['Infantil', 'Fundamental', 'Médio', 'EJA'],
+                        [row['IN_INF'], row['IN_FUND_AI'] or row['IN_FUND_AF'], row['IN_MED'], row['IN_EJA']]
+                    ) if flag == 1
+                ]
+                matriculas_data.extend(
+                    (id_escola, nivel, int(row['QT_MAT_BAS']), int(row['QT_MAT_BAS_INDIGENA']), row['NU_ANO_CENSO'])
+                    for nivel in niveis
+                )
+            insert_batch(
+                'INSERT INTO "Matricula" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_MATRICULAS_TOTAL", "QT_MATRICULAS_INDIGENAS", "ANO_REFERENCIA") VALUES (%s, %s, %s, %s, %s)',
+                matriculas_data
             )
-        insert_batch(
-            'INSERT INTO "Matricula" ("ID_ESCOLA", "NIVEL_ENSINO", "QT_MATRICULAS_TOTAL", "QT_MATRICULAS_INDIGENAS", "ANO_REFERENCIA") VALUES (%s, %s, %s, %s, %s)',
-            matriculas_data
-        )
 
         # 7. Territorio Indígena
-        # Na função carregar_csv_censo(), manter a abordagem original:
         territorios = df[df['TP_LOCALIZACAO_DIFERENCIADA'] == 1][['SG_UF', 'NO_MUNICIPIO']].drop_duplicates()
         for _, row in territorios.iterrows():
             if row['SG_UF'] in ufs_dict:
@@ -290,15 +329,25 @@ def carregar_csv_censo():
         print("CSV do Censo Escolar carregado com sucesso.")
     except Exception as e:
         print(f"Erro ao carregar CSV: {e}")
-        conn.rollback()
+        conn.rollback()   
+
 # Função para carregar e processar múltiplos arquivos XLSX
 # Lê os dados de arquivos XLSX e insere nas tabelas do banco de dados
 def carregar_xlsx(arquivos_xlsx):
     try:
-        # Populate ufs_dict with data from the database
+        # Recarregar os dicionários com os dados atualizados do banco
+        cursor.execute('SELECT "NOME_REGIAO", "ID_REGIAO" FROM "Regiao"')
+        regioes_dict = {nome: id_regiao for nome, id_regiao in cursor.fetchall()}
+
         cursor.execute('SELECT "SIGLA_UF", "ID_UF" FROM "Unidade_Federativa"')
-        for sigla_uf, id_uf in cursor.fetchall():
-            ufs_dict[sigla_uf] = id_uf
+        ufs_dict = {sigla: id_uf for sigla, id_uf in cursor.fetchall()}
+
+        cursor.execute('SELECT "NOME_MUNICIPIO", "ID_MUNICIPIO" FROM "Municipio"')
+        municipios_dict = {nome: id_municipio for nome, id_municipio in cursor.fetchall()}
+
+        cursor.execute('SELECT "NOME_ESCOLA", "ID_ESCOLA" FROM "Escola"')
+        escolas_dict = {nome: id_escola for nome, id_escola in cursor.fetchall()}
+
 
         for arquivo in arquivos_xlsx:
             print(f"Processando arquivo: {arquivo}")
