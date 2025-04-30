@@ -143,10 +143,8 @@ def criar_esquema():
 # Função para carregar e processar o CSV do Censo Escolar
 # Lê os dados do arquivo CSV e insere nas tabelas do banco de dados
 def carregar_csv_censo():
-    regioes_dict = {}
-    ufs_dict = {}
-    municipios_dict = {}
-    escolas_dict = {}
+    global regioes_dict, ufs_dict, municipios_dict, escolas_dict
+
 
     print("Carregando CSV do Censo Escolar...")
     try:
@@ -172,6 +170,19 @@ def carregar_csv_censo():
         # Inserir dados em lote
         def insert_batch(query, data):
             psycopg2.extras.execute_batch(cursor, query, data)
+
+        cursor.execute('CREATE TEMP TABLE temp_csv ("NO_MUNICIPIO" VARCHAR(100), "CO_MUNICIPIO" INT) ON COMMIT DROP')
+
+        municipios_csv = df[['NO_MUNICIPIO', 'CO_MUNICIPIO']].drop_duplicates()
+        psycopg2.extras.execute_batch(cursor,
+            'INSERT INTO temp_csv ("NO_MUNICIPIO", "CO_MUNICIPIO") VALUES (%s, %s)',
+            [(row['NO_MUNICIPIO'], row['CO_MUNICIPIO']) for _, row in municipios_csv.iterrows()]
+        )
+
+
+        # Verifique se a tabela foi criada corretamente
+        cursor.execute('SELECT COUNT(*) FROM temp_csv')
+        print(f"Tabela temporária criada com {cursor.fetchone()[0]} registros")
 
         # 1. Regiao
         regioes = df.groupby('NO_REGIAO').agg({'QT_MAT_BAS': 'sum', 'QT_MAT_BAS_INDIGENA': 'sum'}).reset_index()
@@ -202,33 +213,60 @@ def carregar_csv_censo():
 
         # 3. Municipio
         municipios = df.groupby(['CO_MUNICIPIO', 'NO_MUNICIPIO', 'SG_UF']).agg({'QT_MAT_BAS': 'sum', 'QT_MAT_BAS_INDIGENA': 'sum'}).reset_index()
+        
         municipios_data = [
             (row['NO_MUNICIPIO'], ufs_dict.get(row['SG_UF'], None), int(row['QT_MAT_BAS']), int(row['QT_MAT_BAS_INDIGENA']))
             for _, row in municipios.iterrows() if row['SG_UF'] in ufs_dict
         ]
-        insert_batch(
-            'INSERT INTO "Municipio" ("NOME_MUNICIPIO", "ID_UF", "POPULACAO_TOTAL", "POPULACAO_INDIGENA") VALUES (%s, %s, %s, %s) RETURNING "ID_MUNICIPIO"',
+        psycopg2.extras.execute_batch(cursor,
+            'INSERT INTO "Municipio" ("NOME_MUNICIPIO", "ID_UF", "POPULACAO_TOTAL", "POPULACAO_INDIGENA") VALUES (%s, %s, %s, %s)',
             municipios_data
         )
 
+
+        # Dicionários de mapeamento
+        # Dicionário principal (nome -> ID)
         cursor.execute('SELECT "NOME_MUNICIPIO", "ID_MUNICIPIO" FROM "Municipio"')
         municipios_dict = {nome: id_municipio for nome, id_municipio in cursor.fetchall()}
 
-        # 4. Escola
+        # Dicionário auxiliar (CO_MUNICIPIO -> ID_MUNICIPIO)
+
+        # Primeiro, verifique a estrutura dos resultados
+        cursor.execute('''
+            SELECT m."NOME_MUNICIPIO", m."ID_MUNICIPIO", c."CO_MUNICIPIO" 
+            FROM "Municipio" m
+            JOIN temp_csv c ON m."NOME_MUNICIPIO" = c."NO_MUNICIPIO"
+        ''')
+        resultados = cursor.fetchall()
+
+        # Debug: verifique a estrutura
+        if resultados:
+            print("Exemplo de linha do resultado:", resultados[0])
+            print("Tipo da linha:", type(resultados[0]))
+
+        # Crie o dicionário conforme a estrutura adequada
+        try:
+            if resultados and isinstance(resultados[0], (list, tuple)):
+                municipios_cod_dict = {row[2]: row[1] for row in resultados}
+            elif resultados and isinstance(resultados[0], dict):
+                municipios_cod_dict = {row['CO_MUNICIPIO']: row['ID_MUNICIPIO'] for row in resultados}
+            else:
+                print("Formato de resultados não reconhecido")
+                municipios_cod_dict = {}
+        except Exception as e:
+            print(f"Erro ao criar dicionário: {e}")
+            municipios_cod_dict = {}
+
+        print(f"Dicionário criado com {len(municipios_cod_dict)} entradas")
+
+
+        # 4. Escola - Agora usando o dicionário auxiliar
         escolas = df[['CO_ENTIDADE', 'NO_ENTIDADE', 'CO_MUNICIPIO', 'TP_DEPENDENCIA', 
                     'TP_LOCALIZACAO', 'TP_SITUACAO_FUNCIONAMENTO', 'IN_EDUCACAO_INDIGENA']].drop_duplicates()
 
-        # Verificar se há dados para inserir
-        print(f"Total de escolas encontradas no CSV: {len(escolas)}")
-        print(f"Exemplo de CO_MUNICIPIO: {escolas['CO_MUNICIPIO'].iloc[0]}")
-
-        # Verificar mapeamento de municípios
-        cursor.execute('SELECT COUNT(*) FROM "Municipio"')
-        print(f"Total de municípios no banco: {cursor.fetchone()[0]}")
-
         escolas_data = []
         for _, row in escolas.iterrows():
-            id_municipio = municipios_dict.get(str(row['CO_MUNICIPIO']))
+            id_municipio = municipios_cod_dict.get(row['CO_MUNICIPIO'])
             if id_municipio is None:
                 print(f"Município não encontrado para CO_MUNICIPIO: {row['CO_MUNICIPIO']}")
                 continue
@@ -245,13 +283,22 @@ def carregar_csv_censo():
         print(f"Total de escolas a inserir: {len(escolas_data)}")
 
         if escolas_data:
+            # Execute o batch insert
             psycopg2.extras.execute_batch(
                 cursor,
                 'INSERT INTO "Escola" ("NOME_ESCOLA", "ID_MUNICIPIO", "TIPO_DEPENDENCIA", "TIPO_LOCALIZACAO", "SITUACAO_FUNCIONAMENTO", "INDIGENA") VALUES (%s, %s, %s, %s, %s, %s) RETURNING "ID_ESCOLA"',
                 escolas_data
             )
+            
+            # Obtenha todos os IDs retornados de uma vez
             returned_ids = [row[0] for row in cursor.fetchall()]
-            escolas_dict.update({row['CO_ENTIDADE']: id_escola for row, id_escola in zip(escolas.itertuples(), returned_ids)})
+            
+            # Atualize o dicionário garantindo que temos IDs para todas as escolas
+            escolas_dict.update({
+                row['CO_ENTIDADE']: returned_ids[i]
+                for i, (_, row) in enumerate(escolas.iterrows())
+                if i < len(returned_ids)
+            })
             print(f"Total de escolas inseridas: {len(returned_ids)}")
         else:
             print("Nenhuma escola para inserir - verifique os logs acima")    
@@ -330,6 +377,7 @@ def carregar_csv_censo():
     except Exception as e:
         print(f"Erro ao carregar CSV: {e}")
         conn.rollback()   
+
 
 # Função para carregar e processar múltiplos arquivos XLSX
 # Lê os dados de arquivos XLSX e insere nas tabelas do banco de dados
