@@ -1,5 +1,5 @@
 Projeto da disciplina de Banco de Dados(MC563) da Unicamp
-Alunos: Johatan dos Reis Lima 250502,  Alane Benjamim dos Santos
+Alunos: Johatan dos Reis Lima 250502,  Alane Benjamim dos Santos 230457
 ODS 4: Educação
 Tema Educação Indígena
 
