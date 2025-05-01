@@ -2,14 +2,15 @@ import psycopg2
 from psycopg2 import extras
 import pandas as pd
 import uuid
+import os
 
 # Conectar ao banco de dados PostgreSQL
 # Configura a conexão com o banco de dados PostgreSQL usando as credenciais fornecidas
 conn = psycopg2.connect(
-    dbname="db_250502",
-    user="ra250502",
-    password="oSaiph1pie",
-    host="bidu.lab.ic.unicamp.br",
+    dbname="seu_banco_de_dados",
+    user="seu_usuario",
+    password="sua_senha",
+    host="seu_host",
     port="5432"
 )
 cursor = conn.cursor()
@@ -149,7 +150,7 @@ def carregar_csv_censo():
     print("Carregando CSV do Censo Escolar...")
     try:
         # Lê o arquivo CSV com os dados do censo escolar
-        df = pd.read_csv('microdados_ed_basica_2023.csv', sep=';', low_memory=False, encoding='latin1')
+        df = pd.read_csv('./datasets/microdados_ed_basica_2023.csv', sep=';', low_memory=False, encoding='latin1')
         if df.empty:
             raise ValueError("CSV inválido! O arquivo está vazio ou não contém dados válidos.")
 
@@ -411,7 +412,7 @@ def carregar_csv_censo():
 
 # Função para carregar e processar múltiplos arquivos XLSX
 # Lê os dados de arquivos XLSX e insere nas tabelas do banco de dados
-def carregar_xlsx(arquivos_xlsx):
+def carregar_xlsx():
     try:
         # Recarregar os dicionários com os dados atualizados do banco
         cursor.execute('SELECT "NOME_REGIAO", "ID_REGIAO" FROM "Regiao"')
@@ -426,6 +427,11 @@ def carregar_xlsx(arquivos_xlsx):
         cursor.execute('SELECT "NOME_ESCOLA", "ID_ESCOLA" FROM "Escola"')
         escolas_dict = {nome: id_escola for nome, id_escola in cursor.fetchall()}
 
+        # Caminho para a pasta de datasets
+        datasets_folder = './datasets'
+
+        # Listar todos os arquivos na pasta datasets
+        arquivos_xlsx = [os.path.join(datasets_folder, f) for f in os.listdir(datasets_folder) if f.endswith('.xlsx')]
 
         for arquivo in arquivos_xlsx:
             print(f"Processando arquivo: {arquivo}")
@@ -462,7 +468,7 @@ def carregar_xlsx(arquivos_xlsx):
                 '25 anos ou mais': 6 # col_6
             }
             
-            if 'frequencia_escolar.xlsx' in arquivo:
+            if 'frequencia_escolar' in arquivo:
                 # Processar frequencia_escolar.xlsx
                 df = pd.read_excel(arquivo, header=None, skiprows=5)
                 
@@ -529,7 +535,7 @@ def carregar_xlsx(arquivos_xlsx):
                 
                 print(f"Total de inserções realizadas em Frequencia_Escolar: {total_insercoes}")
 
-            elif 'media_anos.xlsx' in arquivo:
+            elif 'media_anos' in arquivo:
                 # Processar media_anos.xlsx
                 df = pd.read_excel(arquivo, header=None, skiprows=5)
                 
@@ -1051,16 +1057,10 @@ def executar_consultas_analiticas():
 
 # Executar as funções
 if __name__ == "__main__":
-    arquivos_xlsx = [
-        'frequencia_escolar.xlsx',
-        'nivel_instrucao.xlsx',
-        'media_anos.xlsx'
-    ]
-
     try:
         criar_esquema()
         carregar_csv_censo()
-        carregar_xlsx(arquivos_xlsx)
+        carregar_xlsx()
         executar_consultas_analiticas()
     finally:
         cursor.close()
